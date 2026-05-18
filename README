@@ -1,0 +1,7 @@
+OPEN API SPECIFICATION FORGE
+
+To generate fast, static API docs from your OpenAPI 3.x spec. Zero dependencies, single HTML output, deployable anywhere — S3, CDN, or local. Built to handle big endpoint APIs without the browser-hanging bulk of tools.
+
+
+Author:  Azeem Mirza
+License: MIT
