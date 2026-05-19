@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+MANIFEST
+pip-wheel-metadata/
+
+# uv / venv
+.venv/
+venv/
+env/
+.python-version
+
+# mypy / type checkers
+.mypy_cache/
+.dmypy.json
+.pytype/
+.pyre/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated examples
+examples/*.html
+examples/*.json
+api-docs.html
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (legacy)
+node_modules/
+
+# AI tools
+.claude/
+.cursor/
+.windsurf/
+.copilot/
+.codeium/
+.aider*
+.continue/
