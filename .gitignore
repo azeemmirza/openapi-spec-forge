@@ -30,11 +30,6 @@ env/
 .coverage
 htmlcov/
 
-# Generated examples
-examples/*.html
-examples/*.json
-api-docs.html
-
 # OS
 .DS_Store
 Thumbs.db
