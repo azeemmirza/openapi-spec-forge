@@ -1,5 +1,5 @@
 [project]
-name = "openapi-spec-forge"
+name = "openapi-spec-builder"
 version = "0.1.0"
 description = "Generate fast, static API docs from your OpenAPI spec. Zero dependencies."
 readme = "README.md"

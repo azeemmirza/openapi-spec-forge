@@ -41,7 +41,7 @@ def parse_args(argv):
 
 def print_help():
     print("""
-openapi-spec-forge — generate static API docs from an OpenAPI 3.x spec
+openapi-spec-builder — generate static API docs from an OpenAPI 3.x spec
 
 Usage:
   ./bin/build --input <openapi.json> [options]

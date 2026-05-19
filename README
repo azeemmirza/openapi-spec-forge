@@ -1,4 +1,4 @@
-openapi-spec-forge
+openapi-spec-builder
 
 To generate fast, static API docs from your OpenAPI 3.x spec. Zero dependencies, single HTML
 output, deployable anywhere — S3, CDN, or local. Built to handle big endpoint APIs without the

@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+
+
+import json
+import sys
+from pathlib import Path
+
+OUT = Path(__file__).parent.parent / 'examples'
+
+
+# shared builders
+
+page_params = [
+    {'name': 'page',     'in': 'query', 'schema': {'type': 'integer', 'default': 1}},
+    {'name': 'pageSize', 'in': 'query', 'schema': {'type': 'integer', 'default': 20}},
+]
+
+error_content = {'application/json': {'schema': {'$ref': '#/components/schemas/Error'}}}
+
+# i might need to add more specific error responses for certain endpoints, but this is a good starting point for all generic errors
+error_responses = {
+    400: {'description': 'Bad Request',           'content': error_content},
+    401: {'description': 'Unauthorized',          'content': error_content},
+    403: {'description': 'Forbidden',             'content': error_content},
+    404: {'description': 'Not Found',             'content': error_content},
+    422: {'description': 'Unprocessable Entity',  'content': error_content},
+    500: {'description': 'Internal Server Error', 'content': error_content},
+}
+
+error_schema = {
+    'type': 'object',
+    'required': ['code', 'message'],
+    'properties': {
+        'code':      {'type': 'string', 'example': 'INVALID_REQUEST', 'description': 'Machine-readable error code'},
+        'message':   {'type': 'string', 'example': 'The request was invalid.', 'description': 'Human-readable error description'},
+        'details': {
+            'type': 'array',
+            'description': 'Field-level validation errors',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'field':   {'type': 'string'},
+                    'message': {'type': 'string'},
+                    'code':    {'type': 'string'},
+                },
+            },
+        },
+        'requestId': {'type': 'string', 'format': 'uuid', 'readOnly': True},
+        'timestamp': {'type': 'string', 'format': 'date-time', 'readOnly': True},
+    },
+}
+
+
+def to_pascal(s):
+    import re
+    s = re.sub(r'-([a-z])', lambda m: m.group(1).upper(), s)
+    return s[0].upper() + s[1:] if s else s
+
+def to_camel(s):
+    import re
+    return re.sub(r'-([a-z])', lambda m: m.group(1).upper(), s)
+
+def id_param(name):
+    return {'name': f'{name}Id', 'in': 'path', 'required': True, 'schema': {'type': 'string', 'format': 'uuid'}}
+
+def list_resp(ref):
+    return {
+        'description': 'Success',
+        'content': {'application/json': {'schema': {'type': 'object', 'properties': {
+            'data': {'type': 'array', 'items': {'$ref': f'#/components/schemas/{ref}'}},
+            'total': {'type': 'integer'}, 'page': {'type': 'integer'}, 'pageSize': {'type': 'integer'},
+        }}}},
+    }
+
+def item_resp(ref):
+    return {'description': 'Success', 'content': {'application/json': {'schema': {'$ref': f'#/components/schemas/{ref}'}}}}
+
+def body_param(ref):
+    return {'required': True, 'content': {'application/json': {'schema': {'$ref': f'#/components/schemas/{ref}'}}}}
+
+def make_schema(name, extra=None):
+    props = {
+        'id':        {'type': 'string', 'format': 'uuid', 'readOnly': True},
+        'createdAt': {'type': 'string', 'format': 'date-time', 'readOnly': True},
+        'updatedAt': {'type': 'string', 'format': 'date-time', 'readOnly': True},
+        'status':    {'type': 'string', 'enum': ['active', 'inactive', 'pending', 'closed', 'suspended']},
+    }
+    if extra:
+        props.update(extra)
+    return {'type': 'object', 'properties': props}
+
+def list_op(tag, summary, schema, extra=None):
+    params = page_params + (extra or [])
+    return {'tags': [tag], 'summary': summary, 'parameters': params, 'responses': {200: list_resp(schema), **error_responses}}
+
+def create_op(tag, summary, body, res):
+    return {'tags': [tag], 'summary': summary, 'requestBody': body_param(body), 'responses': {201: item_resp(res), **error_responses}}
+
+def get_op(tag, summary, schema, params=None):
+    return {'tags': [tag], 'summary': summary, 'parameters': params or [], 'responses': {200: item_resp(schema), **error_responses}}
+
+def put_op(tag, summary, body, res, params=None):
+    return {'tags': [tag], 'summary': summary, 'parameters': params or [], 'requestBody': body_param(body), 'responses': {200: item_resp(res), **error_responses}}
+
+def patch_op(tag, summary, body, res, params=None):
+    return {'tags': [tag], 'summary': summary, 'parameters': params or [], 'requestBody': body_param(body), 'responses': {200: item_resp(res), **error_responses}}
+
+def del_op(tag, summary, params=None):
+    return {'tags': [tag], 'summary': summary, 'parameters': params or [], 'responses': {204: {'description': 'Deleted'}, **error_responses}}
+
+def action_op(tag, summary, body, res, params=None):
+    op = {'tags': [tag], 'summary': summary, 'parameters': params or [], 'responses': {200: item_resp(res), **error_responses}}
+    if body:
+        op['requestBody'] = body_param(body)
+    return op
+
+
+def build_spec(title, version, description, contact, servers, tag_defs, groups):
+    paths = {}
+    schemas = {'Error': error_schema}
+    count = 0
+
+    for grp in groups:
+        g = grp['group']
+        tag = grp['tag']
+        subs = grp.get('subs', [])
+        actions = grp.get('actions', [])
+        extra_filters = grp.get('extraFilters', [])
+
+        G = to_pascal(g)
+
+        schemas[G] = make_schema(G, {'name': {'type': 'string'}})
+        schemas[f'{G}Input'] = {'type': 'object', 'properties': {'name': {'type': 'string'}, 'status': {'type': 'string'}}}
+
+        paths[f'/{g}'] = {
+            'get':  list_op(tag, f'List {g}', G, [{'name': f, 'in': 'query', 'schema': {'type': 'string'}} for f in extra_filters]),
+            'post': create_op(tag, f'Create {g[:-1] or g}', f'{G}Input', G),
+        }
+        count += 2
+
+        paths[f'/{g}/{{{g}Id}}'] = {
+            'get':    get_op(tag, f'Get {g[:-1] or g}', G, [id_param(g)]),
+            'put':    put_op(tag, f'Update {g[:-1] or g}', f'{G}Input', G, [id_param(g)]),
+            'patch':  patch_op(tag, f'Patch {g[:-1] or g}', f'{G}Input', G, [id_param(g)]),
+            'delete': del_op(tag, f'Delete {g[:-1] or g}', [id_param(g)]),
+        }
+        count += 4
+
+        get_actions = {'summary', 'statistics', 'count', 'balance', 'status', 'validate'}
+        for action in actions:
+            S = f'{G}{to_pascal(action)}'
+            schemas[S] = make_schema(S)
+            paths[f'/{g}/{action}'] = (
+                {'get': get_op(tag, f'{action} {g}', S, list(page_params))}
+                if action in get_actions
+                else {'post': action_op(tag, f'{action} {g}', f'{G}Input', S)}
+            )
+            count += 1
+
+        for sub in subs:
+            Sub = to_pascal(sub)
+            Key = f'{G}{Sub}'
+            sub_id = to_camel(sub)
+
+            schemas[Key] = make_schema(Key, {f'{g}Id': {'type': 'string', 'format': 'uuid'}})
+            schemas[f'{Key}Input'] = {'type': 'object', 'properties': {'status': {'type': 'string'}, 'notes': {'type': 'string'}}}
+
+            paths[f'/{g}/{{{g}Id}}/{sub}'] = {
+                'get':  list_op(tag, f'List {g} {sub}', Key, [id_param(g)] + list(page_params)),
+                'post': create_op(tag, f'Create {g} {sub.rstrip("s") or sub}', f'{Key}Input', Key),
+            }
+            count += 2
+
+            paths[f'/{g}/{{{g}Id}}/{sub}/{{{sub_id}Id}}'] = {
+                'get':    get_op(tag, f'Get {g} {sub.rstrip("s") or sub}', Key, [id_param(g), id_param(sub_id)]),
+                'put':    put_op(tag, f'Update {g} {sub.rstrip("s") or sub}', f'{Key}Input', Key, [id_param(g), id_param(sub_id)]),
+                'patch':  patch_op(tag, f'Patch {g} {sub.rstrip("s") or sub}', f'{Key}Input', Key, [id_param(g), id_param(sub_id)]),
+                'delete': del_op(tag, f'Delete {g} {sub.rstrip("s") or sub}', [id_param(g), id_param(sub_id)]),
+            }
+            count += 4
+
+            for a in ['summary', 'export', 'count', 'validate']:
+                SA = f'{Key}{to_pascal(a)}'
+                schemas[SA] = make_schema(SA)
+                paths[f'/{g}/{{{g}Id}}/{sub}/{a}'] = (
+                    {'get': get_op(tag, f'{a} {g} {sub}', SA, [id_param(g)] + list(page_params))}
+                    if a in ('summary', 'count')
+                    else {'post': action_op(tag, f'{a} {g} {sub}', f'{Key}Input', SA, [id_param(g)])}
+                )
+                count += 1
+
+    spec = {
+        'openapi': '3.0.2',
+        'info': {'title': title, 'version': version, 'description': description, 'contact': contact, 'license': {'name': 'MIT'}},
+        'servers': servers,
+        'tags': tag_defs,
+        'paths': paths,
+        'components': {
+            'schemas': schemas,
+            'securitySchemes': {
+                'BearerAuth': {'type': 'http', 'scheme': 'bearer', 'bearerFormat': 'JWT'},
+                'ApiKeyAuth':  {'type': 'apiKey', 'in': 'header', 'name': 'X-API-Key'},
+                'OAuth2':      {'type': 'oauth2', 'flows': {'clientCredentials': {'tokenUrl': '/oauth/token', 'scopes': {}}}},
+            },
+        },
+        'security': [{'BearerAuth': []}],
+    }
+
+    return spec, count, len(paths), len(schemas)
+
+
+def tag_defs(groups):
+    return [{'name': g['tag'], 'description': f"{g['tag']} management"} for g in groups]
+
+
+# ── Banking API ────────────────────────────────────────────────────────────
+
+banking_groups = [
+    {
+        'group': 'accounts', 'tag': 'Accounts',
+        'extraFilters': ['currency', 'type', 'status', 'customerId'],
+        'actions': ['summary', 'statistics', 'export', 'count', 'validate', 'close', 'reactivate', 'freeze', 'unfreeze', 'bulk-close'],
+        'subs': ['transactions', 'statements', 'cards', 'beneficiaries', 'standing-orders', 'direct-debits', 'limits', 'notifications', 'documents', 'holds', 'mandates', 'interest', 'overdrafts', 'closures'],
+    },
+    {
+        'group': 'customers', 'tag': 'Customers',
+        'extraFilters': ['status', 'type', 'segment', 'country'],
+        'actions': ['summary', 'statistics', 'export', 'count', 'validate', 'verify', 'onboard', 'offboard', 'merge'],
+        'subs': ['accounts', 'cards', 'addresses', 'contacts', 'documents', 'kyc', 'beneficiaries', 'notifications', 'preferences', 'consents', 'relationships', 'history', 'limits', 'risk-profiles'],
+    },
+    {
+        'group': 'transactions', 'tag': 'Transactions',
+        'extraFilters': ['accountId', 'type', 'status', 'currency', 'fromDate', 'toDate'],
+        'actions': ['summary', 'statistics', 'export', 'count', 'search', 'categorize', 'reconcile'],
+        'subs': ['disputes', 'chargebacks', 'receipts', 'reversals', 'categories', 'attachments', 'notes', 'splits', 'history', 'tags'],
+    },
+    {
+        'group': 'payments', 'tag': 'Payments',
+        'extraFilters': ['status', 'type', 'currency', 'fromDate', 'toDate'],
+        'actions': ['summary', 'validate', 'count', 'export', 'bulk-submit', 'bulk-cancel', 'simulate'],
+        'subs': ['standing-orders', 'direct-debits', 'batches', 'receipts', 'history', 'validations', 'templates', 'approvals', 'cancellations', 'returns'],
+    },
+    {
+        'group': 'transfers', 'tag': 'Transfers',
+        'extraFilters': ['status', 'type', 'currency', 'accountId'],
+        'actions': ['validate', 'summary', 'count', 'export', 'simulate', 'bulk-submit'],
+        'subs': ['international', 'domestic', 'scheduled', 'receipts', 'history', 'validations', 'fees', 'documents', 'approvals', 'cancellations'],
+    },
+    {
+        'group': 'cards', 'tag': 'Cards',
+        'extraFilters': ['status', 'type', 'customerId', 'accountId'],
+        'actions': ['summary', 'count', 'export', 'activate', 'deactivate', 'freeze', 'unfreeze'],
+        'subs': ['transactions', 'limits', 'controls', 'disputes', 'replacements', 'virtual', 'documents', 'history', 'pins', 'notifications', 'rewards', 'statements'],
+    },
+    {
+        'group': 'loans', 'tag': 'Loans',
+        'extraFilters': ['status', 'type', 'customerId', 'currency'],
+        'actions': ['summary', 'calculate', 'count', 'export', 'validate', 'approve', 'reject', 'disburse'],
+        'subs': ['repayments', 'schedules', 'documents', 'history', 'modifications', 'statements', 'guarantors', 'collateral', 'insurance', 'disbursements'],
+    },
+    {
+        'group': 'mortgages', 'tag': 'Mortgages',
+        'extraFilters': ['status', 'type', 'customerId'],
+        'actions': ['calculate', 'summary', 'count', 'export', 'approve', 'reject'],
+        'subs': ['repayments', 'documents', 'history', 'valuations', 'insurance', 'statements', 'modifications', 'disbursements', 'guarantors'],
+    },
+    {
+        'group': 'investments', 'tag': 'Investments',
+        'extraFilters': ['type', 'status', 'customerId', 'currency'],
+        'actions': ['summary', 'statistics', 'export', 'count', 'valuate', 'rebalance'],
+        'subs': ['holdings', 'transactions', 'documents', 'dividends', 'history', 'mandates', 'performance', 'statements', 'orders'],
+    },
+    {
+        'group': 'beneficiaries', 'tag': 'Beneficiaries',
+        'extraFilters': ['status', 'type', 'accountId', 'currency'],
+        'actions': ['validate', 'count', 'export', 'summary'],
+        'subs': ['validations', 'history', 'limits', 'documents', 'notifications'],
+    },
+    {
+        'group': 'kyc', 'tag': 'KYC',
+        'extraFilters': ['status', 'customerId', 'type'],
+        'actions': ['summary', 'count', 'export', 'review', 'approve', 'reject'],
+        'subs': ['documents', 'verifications', 'scores', 'history', 'alerts', 'reviews', 'checks', 'reports'],
+    },
+    {
+        'group': 'fraud', 'tag': 'Fraud',
+        'extraFilters': ['status', 'type', 'priority', 'assignee'],
+        'actions': ['summary', 'statistics', 'count', 'export', 'review'],
+        'subs': ['alerts', 'cases', 'rules', 'history', 'reviews', 'decisions', 'reports', 'patterns'],
+    },
+    {
+        'group': 'compliance', 'tag': 'Compliance',
+        'extraFilters': ['status', 'type', 'jurisdiction'],
+        'actions': ['summary', 'statistics', 'export', 'count'],
+        'subs': ['reports', 'alerts', 'rules', 'history', 'reviews', 'decisions', 'audits', 'sanctions'],
+    },
+    {
+        'group': 'fx', 'tag': 'FX',
+        'extraFilters': ['fromCurrency', 'toCurrency', 'type'],
+        'actions': ['summary', 'count', 'export', 'simulate'],
+        'subs': ['rates', 'quotes', 'conversions', 'history', 'limits', 'hedges', 'forwards'],
+    },
+    {
+        'group': 'fees', 'tag': 'Fees',
+        'extraFilters': ['type', 'status', 'accountId'],
+        'actions': ['summary', 'count', 'export', 'calculate', 'waive'],
+        'subs': ['schedules', 'waivers', 'history', 'disputes', 'adjustments', 'tiers'],
+    },
+    {
+        'group': 'limits', 'tag': 'Limits',
+        'extraFilters': ['type', 'accountId', 'cardId'],
+        'actions': ['summary', 'count', 'validate'],
+        'subs': ['accounts', 'cards', 'payments', 'transfers', 'history', 'overrides'],
+    },
+    {
+        'group': 'notifications', 'tag': 'Notifications',
+        'extraFilters': ['type', 'status', 'channel', 'customerId'],
+        'actions': ['summary', 'count', 'export', 'resend', 'bulk-send'],
+        'subs': ['preferences', 'history', 'templates', 'channels', 'subscriptions', 'batches'],
+    },
+    {
+        'group': 'branches', 'tag': 'Branches',
+        'extraFilters': ['country', 'city', 'status'],
+        'actions': ['summary', 'count', 'export', 'nearby'],
+        'subs': ['atms', 'staff', 'hours', 'documents', 'services', 'appointments', 'complaints'],
+    },
+    {
+        'group': 'reports', 'tag': 'Reports',
+        'extraFilters': ['type', 'status', 'fromDate', 'toDate'],
+        'actions': ['summary', 'count', 'export'],
+        'subs': ['statements', 'transactions', 'compliance', 'tax', 'custom', 'scheduled', 'regulatory'],
+    },
+    {
+        'group': 'audit', 'tag': 'Audit',
+        'extraFilters': ['entityType', 'entityId', 'userId', 'fromDate'],
+        'actions': ['summary', 'count', 'export'],
+        'subs': ['events', 'logs', 'accesses', 'exports', 'alerts', 'trails'],
+    },
+    {
+        'group': 'products', 'tag': 'Products',
+        'extraFilters': ['type', 'category', 'status', 'currency'],
+        'actions': ['summary', 'count', 'export', 'validate'],
+        'subs': ['features', 'rates', 'eligibility', 'documents', 'history', 'pricing', 'bundles', 'promotions'],
+    },
+    {
+        'group': 'insurance', 'tag': 'Insurance',
+        'extraFilters': ['type', 'status', 'customerId'],
+        'actions': ['summary', 'count', 'export', 'calculate', 'approve', 'reject'],
+        'subs': ['policies', 'claims', 'documents', 'history', 'renewals', 'endorsements', 'beneficiaries'],
+    },
+]
+
+ecommerce_groups = [
+    {
+        'group': 'products', 'tag': 'Products',
+        'extraFilters': ['category', 'status', 'vendorId', 'minPrice', 'maxPrice', 'inStock'],
+        'actions': ['search', 'summary', 'count', 'export', 'import', 'bulk-update', 'bulk-delete', 'publish', 'unpublish'],
+        'subs': ['variants', 'images', 'attributes', 'categories', 'reviews', 'questions', 'related', 'bundles', 'pricing', 'inventory', 'documents', 'history', 'seo', 'tags'],
+    },
+    {
+        'group': 'categories', 'tag': 'Categories',
+        'extraFilters': ['parentId', 'status', 'level'],
+        'actions': ['summary', 'count', 'export', 'reorder', 'tree'],
+        'subs': ['products', 'subcategories', 'attributes', 'filters', 'images', 'history', 'seo'],
+    },
+    {
+        'group': 'orders', 'tag': 'Orders',
+        'extraFilters': ['status', 'customerId', 'fromDate', 'toDate', 'channel'],
+        'actions': ['summary', 'statistics', 'count', 'export', 'search', 'bulk-cancel', 'bulk-complete'],
+        'subs': ['items', 'payments', 'shipments', 'returns', 'refunds', 'documents', 'history', 'notes', 'tracking', 'invoices', 'discounts', 'taxes', 'events'],
+    },
+    {
+        'group': 'customers', 'tag': 'Customers',
+        'extraFilters': ['status', 'tier', 'fromDate', 'country'],
+        'actions': ['summary', 'statistics', 'count', 'export', 'search', 'merge', 'anonymize'],
+        'subs': ['addresses', 'orders', 'reviews', 'wishlist', 'notifications', 'payment-methods', 'history', 'preferences', 'loyalty', 'segments', 'returns', 'disputes'],
+    },
+    {
+        'group': 'cart', 'tag': 'Cart',
+        'extraFilters': ['customerId', 'status', 'channel'],
+        'actions': ['summary', 'count', 'export', 'recover', 'merge'],
+        'subs': ['items', 'discounts', 'shipping-options', 'taxes', 'history', 'abandonment'],
+    },
+    {
+        'group': 'payments', 'tag': 'Payments',
+        'extraFilters': ['status', 'method', 'fromDate', 'toDate', 'orderId'],
+        'actions': ['summary', 'statistics', 'count', 'export', 'capture', 'void', 'reconcile'],
+        'subs': ['methods', 'transactions', 'refunds', 'disputes', 'history', 'webhooks', 'authorizations', 'captures', 'settlements'],
+    },
+    {
+        'group': 'shipments', 'tag': 'Shipments',
+        'extraFilters': ['status', 'carrierId', 'orderId', 'fromDate'],
+        'actions': ['summary', 'count', 'export', 'track', 'bulk-ship'],
+        'subs': ['tracking', 'documents', 'labels', 'history', 'returns', 'items', 'packages', 'events'],
+    },
+    {
+        'group': 'returns', 'tag': 'Returns',
+        'extraFilters': ['status', 'reason', 'orderId', 'customerId'],
+        'actions': ['summary', 'count', 'export', 'approve', 'reject', 'bulk-process'],
+        'subs': ['items', 'refunds', 'labels', 'history', 'decisions', 'documents', 'inspections', 'restocking'],
+    },
+    {
+        'group': 'inventory', 'tag': 'Inventory',
+        'extraFilters': ['warehouseId', 'productId', 'status', 'belowThreshold'],
+        'actions': ['summary', 'count', 'export', 'reconcile', 'reorder', 'bulk-adjust'],
+        'subs': ['locations', 'movements', 'adjustments', 'alerts', 'history', 'forecasts', 'reservations', 'transfers', 'counts'],
+    },
+    {
+        'group': 'vendors', 'tag': 'Vendors',
+        'extraFilters': ['status', 'country', 'tier'],
+        'actions': ['summary', 'count', 'export', 'approve', 'suspend', 'onboard'],
+        'subs': ['products', 'orders', 'payments', 'documents', 'reviews', 'history', 'contacts', 'contracts', 'payouts', 'performance'],
+    },
+    {
+        'group': 'warehouses', 'tag': 'Warehouses',
+        'extraFilters': ['status', 'country', 'type'],
+        'actions': ['summary', 'count', 'export', 'activate', 'deactivate'],
+        'subs': ['inventory', 'locations', 'shipments', 'receipts', 'history', 'staff', 'zones', 'transfers', 'audits'],
+    },
+    {
+        'group': 'promotions', 'tag': 'Promotions',
+        'extraFilters': ['status', 'type', 'fromDate', 'toDate'],
+        'actions': ['summary', 'count', 'export', 'activate', 'deactivate', 'duplicate'],
+        'subs': ['coupons', 'discounts', 'bundles', 'flash-sales', 'history', 'rules', 'segments', 'usage', 'exclusions'],
+    },
+    {
+        'group': 'coupons', 'tag': 'Coupons',
+        'extraFilters': ['status', 'type', 'promotionId'],
+        'actions': ['validate', 'count', 'export', 'bulk-generate', 'deactivate'],
+        'subs': ['usage', 'history', 'restrictions', 'redemptions'],
+    },
+    {
+        'group': 'reviews', 'tag': 'Reviews',
+        'extraFilters': ['status', 'rating', 'productId', 'customerId'],
+        'actions': ['summary', 'statistics', 'count', 'export', 'approve', 'reject', 'moderate'],
+        'subs': ['responses', 'votes', 'reports', 'history', 'media', 'flags'],
+    },
+    {
+        'group': 'search', 'tag': 'Search',
+        'extraFilters': ['query', 'category', 'type'],
+        'actions': ['summary', 'count', 'export', 'reindex', 'suggest'],
+        'subs': ['results', 'filters', 'suggestions', 'history', 'analytics', 'boosts', 'synonyms'],
+    },
+    {
+        'group': 'notifications', 'tag': 'Notifications',
+        'extraFilters': ['type', 'channel', 'status', 'customerId'],
+        'actions': ['summary', 'count', 'export', 'resend', 'bulk-send'],
+        'subs': ['emails', 'sms', 'push', 'history', 'templates', 'preferences', 'subscriptions', 'batches'],
+    },
+    {
+        'group': 'analytics', 'tag': 'Analytics',
+        'extraFilters': ['metric', 'fromDate', 'toDate', 'channel'],
+        'actions': ['summary', 'export', 'count'],
+        'subs': ['sales', 'products', 'customers', 'traffic', 'conversions', 'funnels', 'cohorts', 'reports', 'dashboards'],
+    },
+    {
+        'group': 'content', 'tag': 'Content',
+        'extraFilters': ['type', 'status', 'channel'],
+        'actions': ['summary', 'count', 'export', 'publish', 'unpublish', 'duplicate'],
+        'subs': ['pages', 'banners', 'blogs', 'documents', 'history', 'seo', 'media', 'translations', 'revisions'],
+    },
+    {
+        'group': 'shipping', 'tag': 'Shipping',
+        'extraFilters': ['carrierId', 'status', 'zone'],
+        'actions': ['calculate', 'validate', 'count', 'export', 'summary'],
+        'subs': ['carriers', 'zones', 'rates', 'rules', 'restrictions', 'tracking-providers', 'labels', 'history'],
+    },
+    {
+        'group': 'tax', 'tag': 'Tax',
+        'extraFilters': ['jurisdiction', 'type', 'status'],
+        'actions': ['calculate', 'validate', 'count', 'export', 'summary'],
+        'subs': ['rates', 'rules', 'exemptions', 'history', 'reports', 'nexus', 'categories', 'filings'],
+    },
+    {
+        'group': 'webhooks', 'tag': 'Webhooks',
+        'extraFilters': ['status', 'event', 'endpoint'],
+        'actions': ['summary', 'count', 'export', 'test', 'requeue'],
+        'subs': ['subscriptions', 'deliveries', 'history', 'retries', 'signatures', 'events'],
+    },
+    {
+        'group': 'settings', 'tag': 'Settings',
+        'extraFilters': ['category', 'scope'],
+        'actions': ['summary', 'export', 'reset'],
+        'subs': ['general', 'payments', 'shipping', 'taxes', 'notifications', 'integrations', 'security', 'billing'],
+    },
+]
+
+healthcare_groups = [
+    {'group': 'claims',        'tag': 'Claims',        'subs': ['lines', 'adjustments', 'attachments', 'notes', 'history', 'status', 'payments', 'denials', 'appeals', 'documents', 'edits', 'codes', 'remarks', 'encounters', 'diagnoses', 'procedures', 'audit', 'batches', 'overrides', 'rejections']},
+    {'group': 'adjudication',  'tag': 'Adjudication',  'subs': ['rules', 'decisions', 'overrides', 'queues', 'batches', 'history', 'codes', 'modifiers', 'criteria', 'exceptions', 'suspensions', 'releases', 'reviews', 'assignments', 'workflows']},
+    {'group': 'members',       'tag': 'Members',       'subs': ['enrollments', 'dependents', 'coverage', 'eligibility', 'benefits', 'claims', 'payments', 'addresses', 'contacts', 'documents', 'history', 'notes', 'appeals', 'authorizations', 'groups']},
+    {'group': 'providers',     'tag': 'Providers',     'subs': ['credentials', 'specialties', 'locations', 'networks', 'contracts', 'claims', 'payments', 'references', 'sanctions', 'licenses', 'groups', 'affiliations', 'history', 'notes', 'documents']},
+    {'group': 'policies',      'tag': 'Policies',      'subs': ['benefits', 'exclusions', 'riders', 'renewals', 'premiums', 'documents', 'endorsements', 'holders', 'dependents', 'rates', 'coverage', 'history', 'notes', 'amendments']},
+    {'group': 'authorizations','tag': 'Authorizations','subs': ['requests', 'approvals', 'denials', 'appeals', 'extensions', 'documents', 'history', 'notes', 'criteria', 'reviews', 'decisions', 'attachments']},
+    {'group': 'payments',      'tag': 'Payments',      'subs': ['claims', 'adjustments', 'refunds', 'eras', 'remittances', 'batches', 'history', 'holds', 'voids', 'reversals', 'checks', 'eft', 'reconciliation']},
+    {'group': 'appeals',       'tag': 'Appeals',       'subs': ['requests', 'decisions', 'hearings', 'documents', 'history', 'notes', 'evidence', 'outcomes', 'extensions', 'assignments', 'reviews']},
+    {'group': 'eligibility',   'tag': 'Eligibility',   'subs': ['checks', 'responses', 'history', 'transactions', 'verifications', 'subscribers', 'dependents', 'coverage', 'benefits', 'limitations']},
+    {'group': 'formulary',     'tag': 'Formulary',     'subs': ['drugs', 'tiers', 'restrictions', 'exceptions', 'alternatives', 'history', 'criteria', 'overrides', 'prior-auth', 'step-therapy', 'quantity-limits']},
+    {'group': 'network',       'tag': 'Network',       'subs': ['providers', 'facilities', 'groups', 'contracts', 'directories', 'updates', 'tiers', 'credentialing', 'sanctions', 'exclusions']},
+    {'group': 'billing',       'tag': 'Billing',       'subs': ['invoices', 'payments', 'adjustments', 'statements', 'history', 'disputes', 'credits', 'write-offs', 'refunds', 'batches']},
+    {'group': 'reports',       'tag': 'Reports',       'subs': ['claims', 'financial', 'utilization', 'quality', 'compliance', 'custom', 'scheduled', 'exports', 'templates', 'subscriptions']},
+    {'group': 'audit',         'tag': 'Audit',         'subs': ['events', 'logs', 'changes', 'accesses', 'exports', 'alerts', 'rules']},
+    {'group': 'diagnoses',     'tag': 'Diagnoses',     'subs': ['codes', 'groups', 'mappings', 'validations', 'history', 'crosswalks', 'exclusions']},
+    {'group': 'procedures',    'tag': 'Procedures',    'subs': ['codes', 'groups', 'modifiers', 'mappings', 'validations', 'bundles', 'exclusions']},
+    {'group': 'remittance',    'tag': 'Remittance',    'subs': ['advices', 'transactions', 'adjustments', 'history', 'reconciliation', 'files', 'errors']},
+    {'group': 'coordination',  'tag': 'Coordination',  'subs': ['benefits', 'claims', 'history', 'rules', 'determinations', 'plans', 'responses']},
+    {'group': 'utilization',   'tag': 'Utilization',   'subs': ['reviews', 'cases', 'decisions', 'history', 'criteria', 'assignments', 'notes', 'attachments']},
+    {'group': 'enrollments',   'tag': 'Enrollments',   'subs': ['applications', 'approvals', 'denials', 'changes', 'terminations', 'history', 'documents', 'verifications', 'groups', 'dependents']},
+    {'group': 'contracts',     'tag': 'Contracts',     'subs': ['terms', 'amendments', 'attachments', 'history', 'rates', 'fee-schedules', 'exclusions', 'renewals', 'notes']},
+    {'group': 'referrals',     'tag': 'Referrals',     'subs': ['requests', 'approvals', 'denials', 'history', 'documents', 'notes', 'extensions', 'encounters']},
+    {'group': 'encounters',    'tag': 'Encounters',    'subs': ['diagnoses', 'procedures', 'providers', 'facilities', 'claims', 'documents', 'notes', 'history']},
+    {'group': 'groups',        'tag': 'Groups',        'subs': ['members', 'policies', 'billing', 'contacts', 'documents', 'history', 'notes', 'administrators']},
+]
+
+# add default actions to healthcare groups
+_hc_actions = ['search', 'export', 'import', 'validate', 'summary', 'statistics', 'bulk-create', 'bulk-update', 'bulk-delete', 'count']
+for _g in healthcare_groups:
+    _g.setdefault('actions', _hc_actions)
+    _g.setdefault('extraFilters', ['status', 'search'])
+
+
+# ── generate & write ───────────────────────────────────────────────────────
+
+def main():
+    OUT.mkdir(exist_ok=True)
+
+    banking_spec, b_count, b_paths, b_schemas = build_spec(
+        title='Banking Platform API',
+        version='2.0.0',
+        description='Comprehensive banking platform API covering accounts, payments, loans, cards, KYC, compliance, and more.',
+        contact={'name': 'API Support', 'email': 'api@bank.example.com'},
+        servers=[
+            {'url': 'https://api.bank.example.com/v2', 'description': 'Production'},
+            {'url': 'https://sandbox.bank.example.com/v2', 'description': 'Sandbox'},
+        ],
+        tag_defs=tag_defs(banking_groups),
+        groups=banking_groups,
+    )
+
+    ecommerce_spec, e_count, e_paths, e_schemas = build_spec(
+        title='E-Commerce Platform API',
+        version='1.0.0',
+        description='Full-featured e-commerce API covering products, orders, inventory, customers, promotions, fulfilment, and analytics.',
+        contact={'name': 'Developer Support', 'email': 'dev@shop.example.com'},
+        servers=[
+            {'url': 'https://api.shop.example.com/v1', 'description': 'Production'},
+            {'url': 'https://staging-api.shop.example.com/v1', 'description': 'Staging'},
+        ],
+        tag_defs=tag_defs(ecommerce_groups),
+        groups=ecommerce_groups,
+    )
+
+    healthcare_spec, h_count, h_paths, h_schemas = build_spec(
+        title='Healthcare Insurance Platform API',
+        version='1.0.0',
+        description='Comprehensive healthcare insurance platform API covering claims, adjudication, members, providers, eligibility, and more.',
+        contact={'name': 'API Support', 'email': 'api-support@example.com'},
+        servers=[
+            {'url': 'https://api.example.com/v1', 'description': 'Production'},
+            {'url': 'https://staging-api.example.com/v1', 'description': 'Staging'},
+        ],
+        tag_defs=tag_defs(healthcare_groups),
+        groups=healthcare_groups,
+    )
+
+    (OUT / 'example-one.json').write_text(json.dumps(banking_spec, indent=2), encoding='utf-8')
+    (OUT / 'example-two.json').write_text(json.dumps(ecommerce_spec, indent=2), encoding='utf-8')
+    (OUT / 'large.json').write_text(json.dumps(healthcare_spec, indent=2), encoding='utf-8')
+
+    b_mb = len(json.dumps(banking_spec)) / 1048576
+    e_mb = len(json.dumps(ecommerce_spec)) / 1048576
+    h_mb = len(json.dumps(healthcare_spec)) / 1048576
+
+    print(f'example-one.json (Banking)')
+    print(f'  Paths: {b_paths}  Endpoints: {b_count}  Schemas: {b_schemas}  Size: {b_mb:.1f} MB')
+    print(f'\nexample-two.json (E-Commerce)')
+    print(f'  Paths: {e_paths}  Endpoints: {e_count}  Schemas: {e_schemas}  Size: {e_mb:.1f} MB')
+    print(f'\nlarge.json (Healthcare)')
+    print(f'  Paths: {h_paths}  Endpoints: {h_count}  Schemas: {h_schemas}  Size: {h_mb:.1f} MB')
+
+
+if __name__ == '__main__':
+    main()
