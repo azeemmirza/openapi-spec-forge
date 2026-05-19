@@ -1,12 +1,12 @@
 OPEN-API SPEC BUILDER
 
+
 To generate fast, static API docs from your OpenAPI 3.x spec. Zero dependencies, single HTML
 output, deployable anywhere — S3, CDN, or local. Built to handle big endpoint APIs without the
 browser-hanging bulk of tools.
 
 
 USAGE
-
   uv venv
   source .venv/bin/activate
 
@@ -15,7 +15,6 @@ USAGE
 
 
 OPTIONS
-
   -i, --input       Path to OpenAPI 3.x JSON file (required)
   -o, --output      Output HTML file            (default: api-docs.html)
   -t, --title       Page title override         (default: from spec)
@@ -25,5 +24,4 @@ OPTIONS
 
 
 LICENSE
-
 MIT — Azeem Mirza
