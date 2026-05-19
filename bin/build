@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from src.builder import build
+
+
+def parse_args(argv):
+    opts = {
+        'input': None,
+        'output': 'api-docs.html',
+        'title': None,
+        'baseUrl': None,
+        'embedData': True,
+        'inlineJs': True,
+    }
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('--input', '-i'):
+            i += 1; opts['input'] = argv[i]
+        elif a in ('--output', '-o'):
+            i += 1; opts['output'] = argv[i]
+        elif a in ('--title', '-t'):
+            i += 1; opts['title'] = argv[i]
+        elif a == '--base-url':
+            i += 1; opts['baseUrl'] = argv[i]
+        elif a == '--no-embed-data':
+            opts['embedData'] = False
+        elif a == '--no-inline-js':
+            opts['inlineJs'] = False
+        elif a in ('--help', '-h'):
+            print_help()
+            sys.exit(0)
+        i += 1
+    return opts
+
+
+def print_help():
+    print("""
+openapi-spec-forge — generate static API docs from an OpenAPI 3.x spec
+
+Usage:
+  ./bin/build --input <openapi.json> [options]
+
+Options:
+  -i, --input        Path to OpenAPI 3.x JSON file  (required)
+  -o, --output       Output HTML file path           (default: api-docs.html)
+  -t, --title        Page title override
+      --base-url     Override server base URL
+      --no-embed-data  Write spec data as a separate .data.json file
+                       instead of inlining it in the HTML
+      --no-inline-js   Write JS and CSS as separate files
+                       instead of inlining them in the HTML
+  -h, --help         Show this help
+
+Examples:
+  ./bin/build -i openapi.json
+  ./bin/build -i openapi.json -o docs/index.html -t "My API"
+  ./bin/build -i openapi.json --no-embed-data --no-inline-js
+""".strip())
+
+
+opts = parse_args(sys.argv[1:])
+
+if not opts['input']:
+    print('Error: --input / -i is required\n', file=sys.stderr)
+    print_help()
+    sys.exit(1)
+
+try:
+    result = build(opts)
+    print(f"\n  Built: {result['output']}")
+    for a in result['assets']:
+        print(f"  Asset: {a}")
+    print(f"  Groups: {result['groupCount']}  Endpoints: {result['endpointCount']}\n")
+except (ValueError, OSError) as e:
+    print(f'\n  Error: {e}\n', file=sys.stderr)
+    sys.exit(1)
